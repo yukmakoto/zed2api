@@ -1,0 +1,13 @@
+.{
+    .name = .zed2api,
+    .version = "0.1.0",
+    .fingerprint = 0xe9992e488b379577,
+    .minimum_zig_version = "0.14.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "webui",
+    },
+    .dependencies = .{},
+}

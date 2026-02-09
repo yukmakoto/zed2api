@@ -1,0 +1,8 @@
+{
+  "accounts": {
+    "my-account": {
+      "user_id": "123456",
+      "credential": {"github_user_id":123456,"github_user_login":"username","access_token":"zed_token_here"}
+    }
+  }
+}

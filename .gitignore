@@ -1,0 +1,9 @@
+.zig-cache/
+zig-out/
+zig-out-*/
+accounts.json
+*.exe
+*.pdb
+zed2api_*.json
+webui/node_modules/
+webui/dist/
