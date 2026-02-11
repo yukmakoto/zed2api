@@ -90,6 +90,101 @@ fn writeMessage(w: *std.io.Writer, msg: std.json.Value) !void {
     try w.writeAll("}");
 }
 
+/// Write Anthropic-native message (passthrough content as-is, including tool_use/tool_result)
+fn writeAnthropicMessage(w: *std.io.Writer, msg: std.json.Value) !void {
+    if (msg != .object) return;
+    // Passthrough the entire message object as-is for Anthropic native format
+    try std.json.Stringify.value(msg, .{}, w);
+}
+
+/// Write message with OpenAI->Anthropic tool support conversion
+fn writeMessageWithToolSupport(w: *std.io.Writer, msg: std.json.Value, allocator: std.mem.Allocator) !void {
+    if (msg != .object) return;
+    const role = switch (msg.object.get("role") orelse return) {
+        .string => |s| s,
+        else => return,
+    };
+
+    // Handle tool call results (OpenAI role=tool -> Anthropic role=user with tool_result)
+    if (std.mem.eql(u8, role, "tool")) {
+        const tool_call_id = switch (msg.object.get("tool_call_id") orelse return) { .string => |s| s, else => return };
+        const content = msg.object.get("content") orelse return;
+        try w.writeAll("{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":");
+        try std.json.Stringify.encodeJsonString(tool_call_id, .{}, w);
+        try w.writeAll(",\"content\":");
+        switch (content) {
+            .string => try std.json.Stringify.encodeJsonString(content.string, .{}, w),
+            else => try std.json.Stringify.value(content, .{}, w),
+        }
+        try w.writeAll("}]}");
+        return;
+    }
+
+    // Handle assistant messages with tool_calls (OpenAI -> Anthropic tool_use)
+    if (std.mem.eql(u8, role, "assistant")) {
+        const tool_calls = msg.object.get("tool_calls");
+        const content = msg.object.get("content");
+        if (tool_calls != null and tool_calls.? == .array) {
+            try w.writeAll("{\"role\":\"assistant\",\"content\":[");
+            var wrote_any = false;
+            // Include text content if present
+            if (content) |c| {
+                switch (c) {
+                    .string => |s| {
+                        if (s.len > 0) {
+                            try w.writeAll("{\"type\":\"text\",\"text\":");
+                            try std.json.Stringify.encodeJsonString(s, .{}, w);
+                            try w.writeAll("}");
+                            wrote_any = true;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            // Convert tool_calls to tool_use blocks
+            for (tool_calls.?.array.items) |tc| {
+                if (tc != .object) continue;
+                if (wrote_any) try w.writeAll(",");
+                wrote_any = true;
+                try w.writeAll("{\"type\":\"tool_use\"");
+                if (tc.object.get("id")) |id| {
+                    try w.writeAll(",\"id\":"); try std.json.Stringify.value(id, .{}, w);
+                }
+                if (tc.object.get("function")) |func| {
+                    if (func == .object) {
+                        if (func.object.get("name")) |n| {
+                            try w.writeAll(",\"name\":"); try std.json.Stringify.value(n, .{}, w);
+                        }
+                        if (func.object.get("arguments")) |args| {
+                            try w.writeAll(",\"input\":");
+                            if (args == .string) {
+                                // Parse JSON string arguments into object
+                                const parsed_args = std.json.parseFromSlice(std.json.Value, allocator, args.string, .{}) catch {
+                                    try w.writeAll("{}");
+                                    try w.writeAll("}");
+                                    continue;
+                                };
+                                defer parsed_args.deinit();
+                                try std.json.Stringify.value(parsed_args.value, .{}, w);
+                            } else {
+                                try std.json.Stringify.value(args, .{}, w);
+                            }
+                        } else {
+                            try w.writeAll(",\"input\":{}");
+                        }
+                    }
+                }
+                try w.writeAll("}");
+            }
+            try w.writeAll("]}");
+            return;
+        }
+    }
+
+    // Default: regular message
+    try writeMessage(w, msg);
+}
+
 /// Build Zed completions payload from client request body.
 pub fn buildZedPayload(allocator: std.mem.Allocator, body: []const u8, is_anthropic: bool) ![]const u8 {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -141,11 +236,64 @@ fn buildAnthropicRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed
     if (parsed.object.get("thinking")) |thinking| {
         try w.writeAll("\"thinking\":"); try std.json.Stringify.value(thinking, .{}, w); try w.writeAll(",");
     }
+    // Tools support
+    if (is_anthropic) {
+        // Anthropic native format: tools already in correct format
+        if (parsed.object.get("tools")) |tools| {
+            try w.writeAll("\"tools\":"); try std.json.Stringify.value(tools, .{}, w); try w.writeAll(",");
+        }
+        if (parsed.object.get("tool_choice")) |tc| {
+            try w.writeAll("\"tool_choice\":"); try std.json.Stringify.value(tc, .{}, w); try w.writeAll(",");
+        }
+    } else {
+        // OpenAI format -> Anthropic format conversion
+        if (parsed.object.get("tools")) |tools| {
+            if (tools == .array) {
+                try w.writeAll("\"tools\":[");
+                var first = true;
+                for (tools.array.items) |tool| {
+                    if (tool != .object) continue;
+                    const func = tool.object.get("function") orelse continue;
+                    if (func != .object) continue;
+                    if (!first) try w.writeAll(",");
+                    first = false;
+                    try w.writeAll("{\"name\":");
+                    if (func.object.get("name")) |n| try std.json.Stringify.value(n, .{}, w) else try w.writeAll("\"\"");
+                    if (func.object.get("description")) |d| {
+                        try w.writeAll(",\"description\":"); try std.json.Stringify.value(d, .{}, w);
+                    }
+                    if (func.object.get("parameters")) |p| {
+                        try w.writeAll(",\"input_schema\":"); try std.json.Stringify.value(p, .{}, w);
+                    }
+                    try w.writeAll("}");
+                }
+                try w.writeAll("],");
+            }
+        }
+        if (parsed.object.get("tool_choice")) |tc| {
+            // OpenAI tool_choice -> Anthropic tool_choice
+            if (tc == .string) {
+                if (std.mem.eql(u8, tc.string, "auto")) {
+                    try w.writeAll("\"tool_choice\":{\"type\":\"auto\"},");
+                } else if (std.mem.eql(u8, tc.string, "required")) {
+                    try w.writeAll("\"tool_choice\":{\"type\":\"any\"},");
+                } else if (std.mem.eql(u8, tc.string, "none")) {
+                    // Don't send tool_choice for "none", just omit tools
+                }
+            } else if (tc == .object) {
+                try w.writeAll("\"tool_choice\":"); try std.json.Stringify.value(tc, .{}, w); try w.writeAll(",");
+            }
+        }
+    }
     try w.writeAll("\"messages\":[");
     if (parsed.object.get("messages")) |msgs| {
         if (msgs == .array) for (msgs.array.items, 0..) |msg, i| {
             if (i > 0) try w.writeAll(",");
-            try writeMessage(w, msg);
+            if (is_anthropic) {
+                try writeAnthropicMessage(w, msg);
+            } else {
+                try writeMessageWithToolSupport(w, msg, allocator);
+            }
         };
     }
     try w.writeAll("]");
@@ -211,6 +359,50 @@ fn buildGoogleRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: s
     }
 
     try w.writeAll("\"generationConfig\":{\"candidateCount\":1,\"stopSequences\":[],\"temperature\":1.0},");
+
+    // Tools support for Google format
+    if (is_anthropic) {
+        // Anthropic tools -> Google functionDeclarations
+        if (parsed.object.get("tools")) |tools| {
+            if (tools == .array and tools.array.items.len > 0) {
+                try w.writeAll("\"tools\":[{\"functionDeclarations\":[");
+                var first = true;
+                for (tools.array.items) |tool| {
+                    if (tool != .object) continue;
+                    if (!first) try w.writeAll(",");
+                    first = false;
+                    try w.writeAll("{");
+                    if (tool.object.get("name")) |n| { try w.writeAll("\"name\":"); try std.json.Stringify.value(n, .{}, w); }
+                    if (tool.object.get("description")) |d| { try w.writeAll(",\"description\":"); try std.json.Stringify.value(d, .{}, w); }
+                    if (tool.object.get("input_schema")) |s| { try w.writeAll(",\"parameters\":"); try std.json.Stringify.value(s, .{}, w); }
+                    try w.writeAll("}");
+                }
+                try w.writeAll("]}],");
+            }
+        }
+    } else {
+        // OpenAI tools -> Google functionDeclarations
+        if (parsed.object.get("tools")) |tools| {
+            if (tools == .array and tools.array.items.len > 0) {
+                try w.writeAll("\"tools\":[{\"functionDeclarations\":[");
+                var first = true;
+                for (tools.array.items) |tool| {
+                    if (tool != .object) continue;
+                    const func = tool.object.get("function") orelse continue;
+                    if (func != .object) continue;
+                    if (!first) try w.writeAll(",");
+                    first = false;
+                    try w.writeAll("{");
+                    if (func.object.get("name")) |n| { try w.writeAll("\"name\":"); try std.json.Stringify.value(n, .{}, w); }
+                    if (func.object.get("description")) |d| { try w.writeAll(",\"description\":"); try std.json.Stringify.value(d, .{}, w); }
+                    if (func.object.get("parameters")) |p| { try w.writeAll(",\"parameters\":"); try std.json.Stringify.value(p, .{}, w); }
+                    try w.writeAll("}");
+                }
+                try w.writeAll("]}],");
+            }
+        }
+    }
+
     try w.writeAll("\"contents\":[");
 
     if (parsed.object.get("messages")) |msgs| {
@@ -298,6 +490,7 @@ fn buildXAIRequest(allocator: std.mem.Allocator, w: *std.io.Writer, parsed: std.
 pub const StreamContent = struct {
     thinking: ?[]const u8,
     text: []const u8,
+    tool_calls: ?[]const u8, // JSON array of tool_use blocks
 };
 
 pub fn extractContentFromStream(allocator: std.mem.Allocator, response: []const u8) !StreamContent {
@@ -305,6 +498,15 @@ pub fn extractContentFromStream(allocator: std.mem.Allocator, response: []const 
     errdefer text_buf.deinit();
     var think_buf: std.io.Writer.Allocating = .init(allocator);
     errdefer think_buf.deinit();
+    var tool_buf: std.io.Writer.Allocating = .init(allocator);
+    errdefer tool_buf.deinit();
+
+    // Track tool_use blocks being built from streaming events
+    var current_tool_id: ?[]const u8 = null;
+    var current_tool_name: ?[]const u8 = null;
+    var tool_input_buf: std.io.Writer.Allocating = .init(allocator);
+    defer tool_input_buf.deinit();
+    var tool_count: usize = 0;
 
     var lines = std.mem.splitScalar(u8, response, '\n');
     while (lines.next()) |line| {
@@ -325,6 +527,28 @@ pub fn extractContentFromStream(allocator: std.mem.Allocator, response: []const 
                     }
                     continue;
                 }
+                if (std.mem.eql(u8, et.string, "content_block_start")) {
+                    const cb = obj.object.get("content_block") orelse continue;
+                    if (cb != .object) continue;
+                    const cb_type = switch (cb.object.get("type") orelse continue) { .string => |s| s, else => continue };
+                    if (std.mem.eql(u8, cb_type, "tool_use")) {
+                        if (cb.object.get("id")) |id| {
+                            if (id == .string) {
+                                if (current_tool_id) |old| allocator.free(old);
+                                current_tool_id = allocator.dupe(u8, id.string) catch null;
+                            }
+                        }
+                        if (cb.object.get("name")) |name| {
+                            if (name == .string) {
+                                if (current_tool_name) |old| allocator.free(old);
+                                current_tool_name = allocator.dupe(u8, name.string) catch null;
+                            }
+                        }
+                        tool_input_buf.deinit();
+                        tool_input_buf = .init(allocator);
+                    }
+                    continue;
+                }
                 if (std.mem.eql(u8, et.string, "content_block_delta")) {
                     const delta = obj.object.get("delta") orelse continue;
                     if (delta != .object) continue;
@@ -333,6 +557,35 @@ pub fn extractContentFromStream(allocator: std.mem.Allocator, response: []const 
                         if (delta.object.get("text")) |t| { if (t == .string) try text_buf.writer.writeAll(t.string); }
                     } else if (std.mem.eql(u8, dt, "thinking_delta")) {
                         if (delta.object.get("thinking")) |t| { if (t == .string) try think_buf.writer.writeAll(t.string); }
+                    } else if (std.mem.eql(u8, dt, "input_json_delta")) {
+                        if (delta.object.get("partial_json")) |pj| { if (pj == .string) try tool_input_buf.writer.writeAll(pj.string); }
+                    }
+                    continue;
+                }
+                if (std.mem.eql(u8, et.string, "content_block_stop")) {
+                    // Finalize tool_use block if we were building one
+                    if (current_tool_id != null and current_tool_name != null) {
+                        const tw = &tool_buf.writer;
+                        if (tool_count > 0) try tw.writeAll(",");
+                        try tw.writeAll("{\"id\":");
+                        try std.json.Stringify.encodeJsonString(current_tool_id.?, .{}, tw);
+                        try tw.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
+                        try std.json.Stringify.encodeJsonString(current_tool_name.?, .{}, tw);
+                        try tw.writeAll(",\"arguments\":");
+                        const input_json = tool_input_buf.written();
+                        if (input_json.len > 0) {
+                            try std.json.Stringify.encodeJsonString(input_json, .{}, tw);
+                        } else {
+                            try tw.writeAll("\"{}\"");
+                        }
+                        try tw.writeAll("}}");
+                        tool_count += 1;
+                        allocator.free(current_tool_id.?);
+                        current_tool_id = null;
+                        allocator.free(current_tool_name.?);
+                        current_tool_name = null;
+                        tool_input_buf.deinit();
+                        tool_input_buf = .init(allocator);
                     }
                     continue;
                 }
@@ -378,21 +631,36 @@ pub fn extractContentFromStream(allocator: std.mem.Allocator, response: []const 
         }
     }
 
+    // Cleanup any dangling tool state
+    if (current_tool_id) |id| allocator.free(id);
+    if (current_tool_name) |name| allocator.free(name);
+
     const text = try text_buf.toOwnedSlice();
     const think_written = think_buf.written();
+    const tool_written = tool_buf.written();
+
+    var thinking: ?[]const u8 = null;
     if (think_written.len > 0) {
-        const thinking = try allocator.dupe(u8, think_written);
-        think_buf.deinit();
-        return .{ .thinking = thinking, .text = text };
+        thinking = try allocator.dupe(u8, think_written);
     }
     think_buf.deinit();
-    return .{ .thinking = null, .text = text };
+
+    var tool_calls: ?[]const u8 = null;
+    if (tool_written.len > 0) {
+        // Wrap in array brackets
+        const tc = try std.fmt.allocPrint(allocator, "[{s}]", .{tool_written});
+        tool_calls = tc;
+    }
+    tool_buf.deinit();
+
+    return .{ .thinking = thinking, .text = text, .tool_calls = tool_calls };
 }
 
 pub fn convertToOpenAI(allocator: std.mem.Allocator, response: []const u8, model: []const u8) ![]const u8 {
     const sc = try extractContentFromStream(allocator, response);
     defer allocator.free(sc.text);
     defer if (sc.thinking) |t| allocator.free(t);
+    defer if (sc.tool_calls) |t| allocator.free(t);
 
     var result: std.io.Writer.Allocating = .init(allocator);
     errdefer result.deinit();
@@ -406,8 +674,17 @@ pub fn convertToOpenAI(allocator: std.mem.Allocator, response: []const u8, model
         try std.json.Stringify.encodeJsonString(thinking, .{}, w);
     }
     try w.writeAll(",\"content\":");
-    try std.json.Stringify.encodeJsonString(sc.text, .{}, w);
-    try w.writeAll("},\"finish_reason\":\"stop\"}]}");
+    if (sc.tool_calls != null and sc.text.len == 0) {
+        try w.writeAll("null");
+    } else {
+        try std.json.Stringify.encodeJsonString(sc.text, .{}, w);
+    }
+    if (sc.tool_calls) |tc| {
+        try w.writeAll(",\"tool_calls\":");
+        try w.writeAll(tc);
+    }
+    const finish_reason = if (sc.tool_calls != null) "tool_calls" else "stop";
+    try w.print("}},\"finish_reason\":\"{s}\"}}]}}", .{finish_reason});
     return try result.toOwnedSlice();
 }
 
@@ -415,6 +692,7 @@ pub fn convertToAnthropic(allocator: std.mem.Allocator, response: []const u8, mo
     const sc = try extractContentFromStream(allocator, response);
     defer allocator.free(sc.text);
     defer if (sc.thinking) |t| allocator.free(t);
+    defer if (sc.tool_calls) |t| allocator.free(t);
 
     var result: std.io.Writer.Allocating = .init(allocator);
     errdefer result.deinit();
@@ -423,13 +701,67 @@ pub fn convertToAnthropic(allocator: std.mem.Allocator, response: []const u8, mo
     try w.writeAll("{\"id\":\"msg_zed\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"");
     try w.writeAll(model);
     try w.writeAll("\",\"content\":[");
+    var wrote_any = false;
     if (sc.thinking) |thinking| {
         try w.writeAll("{\"type\":\"thinking\",\"thinking\":");
         try std.json.Stringify.encodeJsonString(thinking, .{}, w);
-        try w.writeAll("},");
+        try w.writeAll("}");
+        wrote_any = true;
     }
-    try w.writeAll("{\"type\":\"text\",\"text\":");
-    try std.json.Stringify.encodeJsonString(sc.text, .{}, w);
-    try w.writeAll("}]}");
+    if (sc.text.len > 0) {
+        if (wrote_any) try w.writeAll(",");
+        try w.writeAll("{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.encodeJsonString(sc.text, .{}, w);
+        try w.writeAll("}");
+        wrote_any = true;
+    }
+    if (sc.tool_calls) |tc| {
+        // Convert OpenAI-format tool_calls back to Anthropic tool_use blocks
+        const parsed_tc = std.json.parseFromSlice(std.json.Value, allocator, tc, .{}) catch null;
+        if (parsed_tc) |ptc| {
+            defer ptc.deinit();
+            if (ptc.value == .array) {
+                for (ptc.value.array.items) |tool_call| {
+                    if (tool_call != .object) continue;
+                    if (wrote_any) try w.writeAll(",");
+                    wrote_any = true;
+                    try w.writeAll("{\"type\":\"tool_use\"");
+                    if (tool_call.object.get("id")) |id| {
+                        try w.writeAll(",\"id\":"); try std.json.Stringify.value(id, .{}, w);
+                    }
+                    if (tool_call.object.get("function")) |func| {
+                        if (func == .object) {
+                            if (func.object.get("name")) |n| {
+                                try w.writeAll(",\"name\":"); try std.json.Stringify.value(n, .{}, w);
+                            }
+                            if (func.object.get("arguments")) |args| {
+                                try w.writeAll(",\"input\":");
+                                if (args == .string) {
+                                    // Parse the JSON string into an object
+                                    const parsed_args = std.json.parseFromSlice(std.json.Value, allocator, args.string, .{}) catch {
+                                        try w.writeAll("{}");
+                                        try w.writeAll("}");
+                                        continue;
+                                    };
+                                    defer parsed_args.deinit();
+                                    try std.json.Stringify.value(parsed_args.value, .{}, w);
+                                } else {
+                                    try std.json.Stringify.value(args, .{}, w);
+                                }
+                            } else {
+                                try w.writeAll(",\"input\":{}");
+                            }
+                        }
+                    }
+                    try w.writeAll("}");
+                }
+            }
+        }
+    }
+    if (!wrote_any) {
+        try w.writeAll("{\"type\":\"text\",\"text\":\"\"}");
+    }
+    const stop_reason = if (sc.tool_calls != null) "tool_use" else "end_turn";
+    try w.print("],\"stop_reason\":\"{s}\"}}", .{stop_reason});
     return try result.toOwnedSlice();
 }

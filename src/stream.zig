@@ -118,6 +118,7 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
     var block_index: usize = 0;
     var got_any_data = false;
     var headers_sent = false;
+    var has_tool_use = false;
 
     const model = providers.extractModelFromBody(allocator, body) catch "claude-sonnet-4-5";
 
@@ -142,7 +143,7 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
                         socket.send(client_stream, msg_start) catch {};
                     }
                     got_any_data = true;
-                    convertAndSendSSE(client_stream, line, &block_index, allocator) catch break;
+                    convertAndSendSSE(client_stream, line, &block_index, &has_tool_use, allocator) catch break;
                 } else {
                     std.debug.print("[stream] non-JSON from upstream: {s}\n", .{line[0..@min(line.len, 200)]});
                 }
@@ -157,7 +158,10 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
     }
 
     if (headers_sent) {
-        socket.send(client_stream, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n") catch {};
+        const stop_reason = if (has_tool_use) "tool_use" else "end_turn";
+        var stop_buf: [256]u8 = undefined;
+        const stop_msg = std.fmt.bufPrint(&stop_buf, "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n", .{stop_reason}) catch "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
+        socket.send(client_stream, stop_msg) catch {};
         socket.send(client_stream, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n") catch {};
     }
 
@@ -184,7 +188,7 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
 }
 
 /// Convert a single Zed streaming JSON line to Anthropic SSE events
-fn convertAndSendSSE(client_stream: std.net.Stream, line: []const u8, block_index: *usize, allocator: std.mem.Allocator) !void {
+fn convertAndSendSSE(client_stream: std.net.Stream, line: []const u8, block_index: *usize, has_tool_use: *bool, allocator: std.mem.Allocator) !void {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return;
     defer parsed.deinit();
 
@@ -215,9 +219,22 @@ fn convertAndSendSSE(client_stream: std.net.Stream, line: []const u8, block_inde
                 var buf: std.io.Writer.Allocating = .init(allocator);
                 defer buf.deinit();
                 const w = &buf.writer;
-                try w.print("event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{d},\"content_block\":{{\"type\":\"{s}\"", .{ block_index.*, cb_type });
-                if (std.mem.eql(u8, cb_type, "thinking")) try w.writeAll(",\"thinking\":\"\"") else try w.writeAll(",\"text\":\"\"");
-                try w.writeAll("}}\n\n");
+                if (std.mem.eql(u8, cb_type, "tool_use")) {
+                    has_tool_use.* = true;
+                    // Pass through tool_use content_block_start with id and name
+                    try w.print("event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{d},\"content_block\":{{\"type\":\"tool_use\"", .{block_index.*});
+                    if (cb.object.get("id")) |id| {
+                        try w.writeAll(",\"id\":"); try std.json.Stringify.value(id, .{}, w);
+                    }
+                    if (cb.object.get("name")) |name| {
+                        try w.writeAll(",\"name\":"); try std.json.Stringify.value(name, .{}, w);
+                    }
+                    try w.writeAll(",\"input\":{}}}\n\n");
+                } else {
+                    try w.print("event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{d},\"content_block\":{{\"type\":\"{s}\"", .{ block_index.*, cb_type });
+                    if (std.mem.eql(u8, cb_type, "thinking")) try w.writeAll(",\"thinking\":\"\"") else try w.writeAll(",\"text\":\"\"");
+                    try w.writeAll("}}\n\n");
+                }
                 try socket.send(client_stream, buf.written());
                 return;
             }
