@@ -87,7 +87,7 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
     var argv_buf: [20][]const u8 = undefined;
     var argc: usize = 0;
     argv_buf[argc] = "curl"; argc += 1;
-    argv_buf[argc] = "-sN"; argc += 1;
+    argv_buf[argc] = "-siN"; argc += 1;
     if (proxy_url) |p| { argv_buf[argc] = "-x"; argc += 1; argv_buf[argc] = p; argc += 1; }
     argv_buf[argc] = "-X"; argc += 1;
     argv_buf[argc] = "POST"; argc += 1;
@@ -119,6 +119,8 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
     var got_any_data = false;
     var headers_sent = false;
     var has_tool_use = false;
+    var http_headers_done = false;
+    var http_status: u16 = 0;
 
     const model = providers.extractModelFromBody(allocator, body) catch "claude-sonnet-4-5";
 
@@ -128,9 +130,38 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
         if (n == 0) break;
 
         if (one[0] == '\n') {
+            if (!http_headers_done) {
+                // Parse HTTP response headers from curl -i
+                const line = line_buf[0..line_len];
+                // Trim trailing \r
+                const trimmed = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
+                if (trimmed.len == 0) {
+                    // Empty line = end of HTTP headers
+                    http_headers_done = true;
+                    if (http_status != 0 and http_status != 200) {
+                        std.debug.print("[stream] upstream HTTP {d}\n", .{http_status});
+                    }
+                } else if (std.mem.startsWith(u8, trimmed, "HTTP/")) {
+                    // Parse status code from "HTTP/1.1 200 OK" or "HTTP/2 200"
+                    var parts = std.mem.splitScalar(u8, trimmed, ' ');
+                    _ = parts.next(); // skip HTTP/x.x
+                    if (parts.next()) |code_str| {
+                        http_status = std.fmt.parseInt(u16, code_str, 10) catch 0;
+                    }
+                }
+                line_len = 0;
+                continue;
+            }
+
             if (line_len > 0) {
                 const line = line_buf[0..line_len];
                 if (line[0] == '{') {
+                    // Check if this is an error response (non-200 status)
+                    if (http_status != 0 and http_status != 200) {
+                        std.debug.print("[stream] upstream error HTTP {d}: {s}\n", .{ http_status, line[0..@min(line.len, 500)] });
+                        line_len = 0;
+                        continue;
+                    }
                     if (!headers_sent) {
                         headers_sent = true;
                         const sse_header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\n\r\n";
@@ -180,7 +211,7 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
         else => 999,
     };
     if (!got_any_data or exit_code != 0) {
-        std.debug.print("[stream] done, {d} blocks, headers_sent={}, curl exit={d}, stderr={s}\n", .{ block_index, headers_sent, exit_code, stderr_buf[0..stderr_len] });
+        std.debug.print("[stream] done, {d} blocks, headers_sent={}, curl exit={d}, http={d}, stderr={s}\n", .{ block_index, headers_sent, exit_code, http_status, stderr_buf[0..stderr_len] });
         // If we got no data, print any remaining buffered content for debugging
         if (!got_any_data and line_len > 0) {
             std.debug.print("[stream] remaining buffer ({d} bytes): {s}\n", .{ line_len, line_buf[0..@min(line_len, 500)] });
