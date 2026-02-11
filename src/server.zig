@@ -11,6 +11,11 @@ const web_ui = @embedFile("web_index_html");
 var account_mgr: accounts.AccountManager = undefined;
 var global_allocator: std.mem.Allocator = undefined;
 
+// Dynamic models cache
+var cached_models_openai: ?[]const u8 = null;
+var cached_models_time: i64 = 0;
+const MODELS_CACHE_TTL: i64 = 3600; // 1 hour
+
 pub fn run(allocator: std.mem.Allocator, port: u16) !void {
     global_allocator = allocator;
     account_mgr = accounts.AccountManager.init(allocator);
@@ -134,7 +139,7 @@ fn route(method: []const u8, path: []const u8, body: []const u8) !Response {
 
     if (std.mem.eql(u8, path, "/")) return .{ .status = 200, .body = web_ui, .content_type = "text/html; charset=utf-8" };
     if (std.mem.eql(u8, path, "/v1/models") and std.mem.eql(u8, method, "GET"))
-        return .{ .status = 200, .body = @embedFile("models.json") };
+        return try handleModels();
     if (std.mem.eql(u8, path, "/api/event_logging/batch"))
         return .{ .status = 200, .body = "{\"status\":\"ok\"}" };
     if (std.mem.startsWith(u8, path, "/v1/messages/count_tokens"))
@@ -260,6 +265,70 @@ fn handleBilling() !Response {
         return .{ .status = 502, .body = "{\"error\":\"failed to fetch user info\"}" };
     };
     return .{ .status = 200, .body = user_info, .allocated = true };
+}
+
+fn handleModels() !Response {
+    const now = std.time.timestamp();
+    if (cached_models_openai) |cached| {
+        if (now - cached_models_time < MODELS_CACHE_TTL) {
+            return .{ .status = 200, .body = cached };
+        }
+    }
+
+    // Fetch from Zed
+    const acc = account_mgr.getCurrent() orelse {
+        // Fallback to static
+        return .{ .status = 200, .body = @embedFile("models.json") };
+    };
+
+    const raw = zed.fetchModels(global_allocator, acc) catch {
+        // Fallback to cache or static
+        if (cached_models_openai) |cached| return .{ .status = 200, .body = cached };
+        return .{ .status = 200, .body = @embedFile("models.json") };
+    };
+    defer global_allocator.free(raw);
+
+    // Convert Zed format to OpenAI format
+    const openai = convertZedModelsToOpenAI(global_allocator, raw) catch {
+        if (cached_models_openai) |cached| return .{ .status = 200, .body = cached };
+        return .{ .status = 200, .body = @embedFile("models.json") };
+    };
+
+    // Update cache
+    if (cached_models_openai) |old| global_allocator.free(old);
+    cached_models_openai = openai;
+    cached_models_time = now;
+
+    std.debug.print("[zed2api] models refreshed ({d} bytes)\n", .{openai.len});
+    return .{ .status = 200, .body = openai };
+}
+
+fn convertZedModelsToOpenAI(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+
+    const models = switch (parsed.value.object.get("models") orelse return error.InvalidFormat) {
+        .array => |a| a,
+        else => return error.InvalidFormat,
+    };
+
+    var buf: std.io.Writer.Allocating = .init(allocator);
+    errdefer buf.deinit();
+    const w = &buf.writer;
+
+    try w.writeAll("{\"object\":\"list\",\"data\":[");
+    var first = true;
+    for (models.items) |model| {
+        if (model != .object) continue;
+        const id = switch (model.object.get("id") orelse continue) { .string => |s| s, else => continue };
+        const provider = switch (model.object.get("provider") orelse continue) { .string => |s| s, else => continue };
+
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.print("{{\"id\":\"{s}\",\"object\":\"model\",\"owned_by\":\"{s}\"}}", .{ id, provider });
+    }
+    try w.writeAll("]}");
+    return try buf.toOwnedSlice();
 }
 
 // ── Login ──

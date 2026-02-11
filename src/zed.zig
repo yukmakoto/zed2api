@@ -148,6 +148,80 @@ fn proxyMessagesInner(allocator: std.mem.Allocator, acc: *accounts.Account, body
     return try providers.convertToAnthropic(allocator, response, model);
 }
 
+// ── Models ──
+
+pub fn fetchModels(allocator: std.mem.Allocator, acc: *accounts.Account) ![]const u8 {
+    const jwt = try getToken(allocator, acc);
+    const bearer = try std.fmt.allocPrint(allocator, "Bearer {s}", .{jwt});
+    defer allocator.free(bearer);
+
+    proxy.init(allocator);
+
+    if (proxy.getHost()) |_| {
+        return fetchModelsViaProxy(allocator, bearer);
+    } else {
+        return fetchModelsDirect(allocator, bearer);
+    }
+}
+
+fn fetchModelsViaProxy(allocator: std.mem.Allocator, bearer: []const u8) ![]const u8 {
+    const p_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ proxy.getHost().?, proxy.getPort() });
+    defer allocator.free(p_url);
+
+    const auth_header = try std.fmt.allocPrint(allocator, "authorization: {s}", .{bearer});
+    defer allocator.free(auth_header);
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{
+            "curl",       "-s",
+            "-x",         p_url,
+            "https://cloud.zed.dev/models",
+            "-H",         auth_header,
+            "-H",         "x-zed-version: 0.222.4+stable.147.b385025df963c9e8c3f74cc4dadb1c4b29b3c6f0",
+            "--max-time", "15",
+        },
+        .max_output_bytes = 1024 * 1024,
+    }) catch return error.UpstreamError;
+    defer allocator.free(result.stderr);
+
+    if (result.term != .Exited or result.term.Exited != 0) {
+        allocator.free(result.stdout);
+        return error.UpstreamError;
+    }
+    if (result.stdout.len == 0 or !std.mem.startsWith(u8, result.stdout, "{")) {
+        allocator.free(result.stdout);
+        return error.UpstreamError;
+    }
+    return result.stdout;
+}
+
+fn fetchModelsDirect(allocator: std.mem.Allocator, bearer: []const u8) ![]const u8 {
+    var response_buf: std.io.Writer.Allocating = .init(allocator);
+    errdefer response_buf.deinit();
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = "https://cloud.zed.dev/models" },
+        .method = .GET,
+        .response_writer = &response_buf.writer,
+        .extra_headers = &.{
+            .{ .name = "authorization", .value = bearer },
+            .{ .name = "x-zed-version", .value = "0.222.4+stable.147.b385025df963c9e8c3f74cc4dadb1c4b29b3c6f0" },
+        },
+    }) catch return error.UpstreamError;
+
+    if (result.status != .ok) {
+        response_buf.deinit();
+        return error.UpstreamError;
+    }
+    return try response_buf.toOwnedSlice();
+}
+
+// ── Billing ──
+
 pub fn fetchBillingUsage(allocator: std.mem.Allocator, acc: *accounts.Account) ![]const u8 {
     const auth_header = try std.fmt.allocPrint(allocator, "{s} {s}", .{ acc.user_id, acc.credential_json });
     defer allocator.free(auth_header);

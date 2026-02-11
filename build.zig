@@ -4,10 +4,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // WebUI build step: npm run build in webui/
-    const npm_cmd = if (b.graph.host.result.os.tag == .windows) "npm.cmd" else "npm";
-    const webui_build = b.addSystemCommand(&.{ npm_cmd, "run", "build" });
-    webui_build.setCwd(b.path("webui"));
+    // WebUI build step: tsc + vite build in webui/
+    // Use node directly to avoid PATH issues with tsc on Windows
+    const node_cmd = if (b.graph.host.result.os.tag == .windows) "node.exe" else "node";
+    const tsc_build = b.addSystemCommand(&.{ node_cmd, "node_modules/typescript/bin/tsc" });
+    tsc_build.setCwd(b.path("webui"));
+    const vite_build = b.addSystemCommand(&.{ node_cmd, "node_modules/vite/bin/vite.js", "build" });
+    vite_build.setCwd(b.path("webui"));
+    vite_build.step.dependOn(&tsc_build.step);
 
     // Zig module
     const mod = b.createModule(.{
@@ -24,7 +28,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // WebUI must be built before compiling (the HTML is embedded)
-    exe.step.dependOn(&webui_build.step);
+    exe.step.dependOn(&vite_build.step);
 
     if (target.result.os.tag == .windows) {
         exe.root_module.linkSystemLibrary("bcrypt", .{});

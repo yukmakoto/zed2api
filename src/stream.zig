@@ -97,7 +97,7 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
     argv_buf[argc] = "-H"; argc += 1;
     argv_buf[argc] = "content-type: application/json"; argc += 1;
     argv_buf[argc] = "-H"; argc += 1;
-    argv_buf[argc] = "x-zed-version: 0.222.4"; argc += 1;
+    argv_buf[argc] = "x-zed-version: 0.222.4+stable.147.b385025df963c9e8c3f74cc4dadb1c4b29b3c6f0"; argc += 1;
     argv_buf[argc] = "--data-binary"; argc += 1;
     argv_buf[argc] = at_path; argc += 1;
     argv_buf[argc] = "--max-time"; argc += 1;

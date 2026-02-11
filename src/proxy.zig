@@ -115,7 +115,7 @@ pub fn sendViaProxy(allocator: std.mem.Allocator, bearer: []const u8, body: []co
             "https://cloud.zed.dev/completions",
             "-H",             auth_header,
             "-H",             "content-type: application/json",
-            "-H",             "x-zed-version: 0.222.4",
+            "-H",             "x-zed-version: 0.222.4+stable.147.b385025df963c9e8c3f74cc4dadb1c4b29b3c6f0",
             "--data-binary",  at_path,
             "--max-time",     "120",
             "-w",             "\n__HTTP_STATUS__%{http_code}",
@@ -195,7 +195,7 @@ pub fn sendToZed(allocator: std.mem.Allocator, jwt: []const u8, body: []const u8
                 .extra_headers = &.{
                     .{ .name = "authorization", .value = bearer },
                     .{ .name = "content-type", .value = "application/json" },
-                    .{ .name = "x-zed-version", .value = "0.222.4" },
+                    .{ .name = "x-zed-version", .value = "0.222.4+stable.147.b385025df963c9e8c3f74cc4dadb1c4b29b3c6f0" },
                 },
             }) catch |err| {
                 std.debug.print("[zed] network error attempt {d}: {}\n", .{ attempt + 1, err });
