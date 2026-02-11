@@ -145,7 +145,7 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
                     got_any_data = true;
                     convertAndSendSSE(client_stream, line, &block_index, &has_tool_use, allocator) catch break;
                 } else {
-                    std.debug.print("[stream] non-JSON from upstream: {s}\n", .{line[0..@min(line.len, 200)]});
+                    std.debug.print("[stream] non-JSON from upstream ({d} bytes): {s}\n", .{ line.len, line[0..@min(line.len, 500)] });
                 }
             }
             line_len = 0;
@@ -181,6 +181,10 @@ fn doStreamProxy(client_stream: std.net.Stream, acc: *accounts.Account, body: []
     };
     if (!got_any_data or exit_code != 0) {
         std.debug.print("[stream] done, {d} blocks, headers_sent={}, curl exit={d}, stderr={s}\n", .{ block_index, headers_sent, exit_code, stderr_buf[0..stderr_len] });
+        // If we got no data, print any remaining buffered content for debugging
+        if (!got_any_data and line_len > 0) {
+            std.debug.print("[stream] remaining buffer ({d} bytes): {s}\n", .{ line_len, line_buf[0..@min(line_len, 500)] });
+        }
     } else {
         std.debug.print("[stream] done, {d} blocks\n", .{block_index});
     }
